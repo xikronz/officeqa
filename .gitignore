@@ -1,0 +1,5 @@
+__pycache__/*
+
+treasury_bulletins_parsed/*
+treasury_bulletin_pdfs/*
+treasury_bulletin_pdfs_no_ocr/*

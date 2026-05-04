@@ -39,12 +39,14 @@ Typical usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
 import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,65 @@ from reward import extract_final_answer, fuzzy_match_answer  # noqa: E402
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5")
 DEFAULT_IN_RATE = float(os.environ.get("OPENAI_PRICE_INPUT_PER_MTOK", "5.0"))
 DEFAULT_OUT_RATE = float(os.environ.get("OPENAI_PRICE_OUTPUT_PER_MTOK", "30.0"))
+
+
+def init_agents_tracing(args: argparse.Namespace) -> None:
+    if not args.enable_openai_tracing:
+        return
+    try:
+        from agents import set_tracing_export_api_key
+    except ImportError as e:
+        raise SystemExit(
+            "OpenAI Agents SDK tracing requested but `agents` is not installed. "
+            "Install it with: pip install openai-agents"
+        ) from e
+
+    api_key = os.environ.get(args.tracing_api_key_env) or os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        set_tracing_export_api_key(api_key)
+
+
+def trace_context(args: argparse.Namespace, row: pd.Series):
+    if not args.enable_openai_tracing:
+        return nullcontext(None)
+    from agents import trace
+
+    trace_id = args.trace_id or f"trace_{uuid.uuid4().hex}"
+    metadata = {
+        "uid": str(row["uid"]),
+        "model": args.model,
+        "vector_store_id": args.vector_store_id,
+        "reasoning_effort": args.reasoning_effort,
+        "reasoning_summary": args.reasoning_summary,
+        "max_file_results": args.max_file_results,
+        "max_output_tokens": args.max_output_tokens,
+        "corpus": args.corpus,
+    }
+    if args.trace_include_question:
+        metadata["question"] = str(row["question"])
+
+    return trace(
+        args.trace_workflow_name,
+        trace_id=trace_id,
+        group_id=args.trace_group_id or str(row["uid"]),
+        metadata=metadata,
+    )
+
+
+def custom_trace_span(args: argparse.Namespace, name: str, data: dict[str, Any] | None = None):
+    if not args.enable_openai_tracing:
+        return nullcontext(None)
+    from agents import custom_span
+
+    return custom_span(name, data or {})
+
+
+def flush_openai_traces(args: argparse.Namespace) -> None:
+    if not args.enable_openai_tracing or not args.flush_traces:
+        return
+    from agents import flush_traces
+
+    flush_traces()
 
 
 def corpus_dir_for(mode: str) -> Path:
@@ -412,21 +473,29 @@ def create_response_with_retries(
                 }
             )
 
+        attempt_data = {
+            "attempt": attempt + 1,
+            "model": kwargs.get("model"),
+            "stream": args.stream,
+            "tool_choice": kwargs.get("tool_choice", "auto"),
+            "max_output_tokens": kwargs.get("max_output_tokens"),
+        }
+        attempt_span = None
         try:
-            if args.stream:
-                with client.responses.stream(**kwargs) as stream:
-                    try:
-                        for event in stream:
-                            event_summary = summarize_event(event, started_monotonic)
-                            event_timeline.append(event_summary)
-                            if args.print_events:
-                                print_event_summary(event_summary)
-                    except Exception as stream_exc:
-                        # Streaming can fail mid-flight (including 429 TPM limits). OpenAI does not
-                        # support reconnecting to an interrupted SSE stream; the practical recovery
-                        # is to start a new Responses request after waiting.
-                        event_timeline.append(
-                            {
+            with custom_trace_span(args, "openai.responses.attempt", attempt_data) as attempt_span:
+                if args.stream:
+                    with client.responses.stream(**kwargs) as stream:
+                        try:
+                            for event in stream:
+                                event_summary = summarize_event(event, started_monotonic)
+                                event_timeline.append(event_summary)
+                                if args.print_events:
+                                    print_event_summary(event_summary)
+                        except Exception as stream_exc:
+                            # Streaming can fail mid-flight (including 429 TPM limits). OpenAI does not
+                            # support reconnecting to an interrupted SSE stream; the practical recovery
+                            # is to start a new Responses request after waiting.
+                            stream_error = {
                                 "timestamp_utc": utc_now_iso(),
                                 "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
                                 "event_type": "client.stream.error",
@@ -434,10 +503,17 @@ def create_response_with_retries(
                                 "error_type": type(stream_exc).__name__,
                                 "error": str(stream_exc),
                             }
-                        )
-                        raise stream_exc
-                    return stream.get_final_response()
-            return client.responses.create(**kwargs)
+                            event_timeline.append(stream_error)
+                            if attempt_span is not None:
+                                attempt_span.set_error(
+                                    {
+                                        "message": str(stream_exc),
+                                        "data": stream_error,
+                                    }
+                                )
+                            raise stream_exc
+                        return stream.get_final_response()
+                return client.responses.create(**kwargs)
         except Exception as exc:
             if not is_rate_limit_error(exc) or attempt >= args.max_rate_limit_retries:
                 event_timeline.append(
@@ -450,6 +526,16 @@ def create_response_with_retries(
                         "error": str(exc),
                     }
                 )
+                if attempt_span is not None:
+                    attempt_span.set_error(
+                        {
+                            "message": str(exc),
+                            "data": {
+                                "attempt": attempt + 1,
+                                "error_type": type(exc).__name__,
+                            },
+                        }
+                    )
                 raise
 
             wait_from_api = retry_after_seconds(exc)
@@ -473,6 +559,19 @@ def create_response_with_retries(
                     "error": str(exc),
                 }
             )
+            with custom_trace_span(
+                args,
+                "openai.responses.rate_limit_wait",
+                {
+                    "attempt": attempt + 1,
+                    "wait_seconds": round(wait_seconds, 3),
+                    "api_retry_after_seconds": wait_from_api,
+                    "max_wait_cap_seconds": max_wait,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            ):
+                pass
             print(
                 f"  rate limited on attempt {attempt + 1}; waiting {wait_seconds:.1f}s before retry",
                 flush=True,
@@ -548,7 +647,21 @@ def run_one_question(client: Any, row: pd.Series, args: argparse.Namespace) -> d
         }
     ]
 
-    response = create_response_with_retries(client, kwargs, args, event_timeline, started_monotonic)
+    with custom_trace_span(
+        args,
+        "officeqa.responses_request",
+        {
+            "uid": str(row["uid"]),
+            "model": args.model,
+            "vector_store_id": args.vector_store_id,
+            "tools": [tool.get("type") for tool in kwargs["tools"]],
+            "tool_choice": kwargs.get("tool_choice", "auto"),
+            "reasoning": kwargs["reasoning"],
+            "max_output_tokens": kwargs["max_output_tokens"],
+            "include": kwargs.get("include", []),
+        },
+    ):
+        response = create_response_with_retries(client, kwargs, args, event_timeline, started_monotonic)
 
     finished_wall = utc_now_iso()
     elapsed_seconds = time.monotonic() - started_monotonic
@@ -570,6 +683,40 @@ def run_one_question(client: Any, row: pd.Series, args: argparse.Namespace) -> d
     input_tokens, output_tokens, reasoning_tokens = usage_counts(response)
     file_search_calls = file_search_items(response)
     annotations = content_annotations(response)
+    retrieved_files = retrieved_files_from_search(response)
+    cited = cited_files(response)
+    with custom_trace_span(
+        args,
+        "officeqa.file_search_summary",
+        {
+            "uid": str(row["uid"]),
+            "queries": [
+                query
+                for call in file_search_calls
+                for query in call.get("queries", [])
+            ],
+            "retrieved_files": retrieved_files,
+            "cited_files": cited,
+        },
+    ):
+        pass
+    with custom_trace_span(
+        args,
+        "officeqa.scoring",
+        {
+            "uid": str(row["uid"]),
+            "score": 1.0 if ok else 0.0,
+            "match_rationale": rationale,
+            "ground_truth": str(row["answer"]) if args.trace_include_sensitive_data else None,
+            "prediction": pred if args.trace_include_sensitive_data else None,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "estimated_cost_usd": estimate_cost_usd(input_tokens, output_tokens),
+            "elapsed_seconds": elapsed_seconds,
+        },
+    ):
+        pass
 
     return {
         "uid": row["uid"],
@@ -610,8 +757,8 @@ def run_one_question(client: Any, row: pd.Series, args: argparse.Namespace) -> d
             for call in file_search_calls
             for query in call.get("queries", [])
         ],
-        "retrieved_files": retrieved_files_from_search(response),
-        "cited_files": cited_files(response),
+        "retrieved_files": retrieved_files,
+        "cited_files": cited,
         "response_id": getattr(response, "id", None),
     }
 
@@ -637,6 +784,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
     if not args.vector_store_id:
         raise SystemExit("eval requires --vector-store-id (run setup first)")
 
+    init_agents_tracing(args)
     client = OpenAI()
     df = pd.read_csv(args.csv, dtype=str)
     if args.uid:
@@ -652,7 +800,11 @@ def cmd_eval(args: argparse.Namespace) -> None:
     with args.output.open("w", encoding="utf-8") as out:
         for i, (_, row) in enumerate(df.iterrows()):
             print(f"running {row['uid']}...", flush=True)
-            result = run_one_question(client, row, args)
+            try:
+                with trace_context(args, row):
+                    result = run_one_question(client, row, args)
+            finally:
+                flush_openai_traces(args)
             scores.append(float(result["score"]))
             total_cost += float(result["estimated_cost_usd"])
             out.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -751,11 +903,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include encrypted reasoning state for multi-turn/ZDR workflows; this is not readable CoT",
     )
     eval_p.add_argument(
+        "--enable-openai-tracing",
+        action="store_true",
+        help="Upload per-sample custom traces/spans to the OpenAI Traces dashboard via the Agents SDK",
+    )
+    eval_p.add_argument("--trace-workflow-name", type=str, default="OfficeQA GPT-5.5 agentic eval")
+    eval_p.add_argument("--trace-group-id", type=str, default=None)
+    eval_p.add_argument(
+        "--trace-id",
+        type=str,
+        default=None,
+        help="Optional explicit trace_<32_alphanumeric> id; only useful for a single-row run",
+    )
+    eval_p.add_argument(
+        "--tracing-api-key-env",
+        type=str,
+        default="OPENAI_API_KEY",
+        help="Env var used by Agents SDK trace exporter",
+    )
+    eval_p.add_argument(
+        "--trace-include-question",
+        action="store_true",
+        help="Include question text in trace metadata",
+    )
+    eval_p.add_argument(
+        "--trace-include-sensitive-data",
+        action="store_true",
+        help="Include ground truth and prediction in scoring span data",
+    )
+    eval_p.add_argument(
+        "--no-flush-traces",
+        dest="flush_traces",
+        action="store_false",
+        help="Do not call agents.flush_traces() after each sample",
+    )
+    eval_p.add_argument(
         "--no-stream",
         dest="stream",
         action="store_false",
         help="Disable streaming event capture; tool timings will only have request start/end",
     )
+    eval_p.set_defaults(flush_traces=True)
     eval_p.set_defaults(stream=True)
     eval_p.set_defaults(func=cmd_eval)
     return parser

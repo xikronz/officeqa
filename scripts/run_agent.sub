@@ -12,6 +12,7 @@
 #   export OFFICEQA_REASONING_EFFORT=high
 #   export OFFICEQA_REASONING_SUMMARY=auto
 #   export OFFICEQA_INCLUDE_SEARCH_RESULTS=0   # disable exact retrieved-file logging
+#   export OFFICEQA_ENABLE_TRACING=0           # disable OpenAI Traces upload
 #   export OFFICEQA_ENABLE_WEB_SEARCH=1
 #   export OFFICEQA_OUTPUT=outputs/agentic_UID0204.jsonl
 
@@ -27,6 +28,7 @@ REASONING_EFFORT="${OFFICEQA_REASONING_EFFORT:-low}"
 REASONING_SUMMARY="${OFFICEQA_REASONING_SUMMARY:-none}"
 MAX_FILE_RESULTS="${OFFICEQA_MAX_FILE_RESULTS:-3}"
 MAX_OUTPUT_TOKENS="${OFFICEQA_MAX_OUTPUT_TOKENS:-1500}"
+ENABLE_TRACING="${OFFICEQA_ENABLE_TRACING:-1}"
 
 mkdir -p "$(dirname "$OUTPUT")"
 
@@ -61,6 +63,10 @@ fi
 
 if [[ "${OFFICEQA_INCLUDE_SEARCH_RESULTS:-1}" == "1" ]]; then
   CMD+=(--include-search-results)
+fi
+
+if [[ "${ENABLE_TRACING}" == "1" ]]; then
+  CMD+=(--enable-openai-tracing --trace-include-question)
 fi
 
 "${CMD[@]}"

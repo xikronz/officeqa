@@ -42,6 +42,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -207,6 +208,20 @@ def content_annotations(response: Any) -> list[dict[str, Any]]:
     return annotations
 
 
+def result_text(result: Any) -> str | None:
+    content = getattr(result, "content", None)
+    if not content:
+        return None
+    first = content[0]
+    return getattr(first, "text", None)
+
+
+def file_search_results(item: Any) -> list[Any]:
+    # Depending on SDK/API version and include setting, the field may appear as
+    # either `results` or `search_results`.
+    return list(getattr(item, "results", None) or getattr(item, "search_results", None) or [])
+
+
 def file_search_items(response: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for item in getattr(response, "output", []) or []:
@@ -215,22 +230,64 @@ def file_search_items(response: Any) -> list[dict[str, Any]]:
         entry: dict[str, Any] = {
             "id": getattr(item, "id", None),
             "status": getattr(item, "status", None),
+            "queries": list(getattr(item, "queries", []) or []),
         }
         results = []
-        for result in getattr(item, "search_results", []) or []:
+        for rank, result in enumerate(file_search_results(item), start=1):
             results.append(
                 {
+                    "rank": rank,
+                    "file_id": getattr(result, "file_id", None),
                     "filename": getattr(result, "filename", None),
                     "score": getattr(result, "score", None),
-                    "text": getattr(getattr(result, "content", [None])[0], "text", None)
-                    if getattr(result, "content", None)
-                    else None,
+                    "text": result_text(result),
                 }
             )
         if results:
-            entry["search_results"] = results
+            entry["results"] = results
         items.append(entry)
     return items
+
+
+def cited_files(response: Any) -> list[dict[str, Any]]:
+    seen: set[tuple[str | None, str | None]] = set()
+    files: list[dict[str, Any]] = []
+    for ann in content_annotations(response):
+        if ann.get("type") != "file_citation":
+            continue
+        key = (ann.get("file_id"), ann.get("filename"))
+        if key in seen:
+            continue
+        seen.add(key)
+        files.append(
+            {
+                "file_id": ann.get("file_id"),
+                "filename": ann.get("filename"),
+                "citation_index": ann.get("index"),
+            }
+        )
+    return files
+
+
+def retrieved_files_from_search(response: Any) -> list[dict[str, Any]]:
+    seen: set[tuple[str | None, str | None]] = set()
+    files: list[dict[str, Any]] = []
+    for call in file_search_items(response):
+        for result in call.get("results", []):
+            key = (result.get("file_id"), result.get("filename"))
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(
+                {
+                    "file_id": result.get("file_id"),
+                    "filename": result.get("filename"),
+                    "best_rank": result.get("rank"),
+                    "best_score": result.get("score"),
+                    "file_search_call_id": call.get("id"),
+                }
+            )
+    return files
 
 
 def tool_call_items(response: Any) -> list[dict[str, Any]]:
@@ -257,6 +314,19 @@ def summarize_event(event: Any, started_monotonic: float) -> dict[str, Any]:
         entry["item_type"] = getattr(item, "type", None)
         entry["item_status"] = getattr(item, "status", None)
         entry["item_name"] = getattr(item, "name", None)
+        if getattr(item, "type", None) == "file_search_call":
+            entry["queries"] = list(getattr(item, "queries", []) or [])
+            result_files = []
+            for result in file_search_results(item):
+                result_files.append(
+                    {
+                        "file_id": getattr(result, "file_id", None),
+                        "filename": getattr(result, "filename", None),
+                        "score": getattr(result, "score", None),
+                    }
+                )
+            if result_files:
+                entry["result_files"] = result_files
 
     output_index = getattr(event, "output_index", None)
     if output_index is not None:
@@ -267,6 +337,150 @@ def summarize_event(event: Any, started_monotonic: float) -> dict[str, Any]:
         entry["delta_chars"] = len(delta)
 
     return entry
+
+
+def print_event_summary(entry: dict[str, Any]) -> None:
+    event_type = entry.get("event_type")
+    if event_type in {"response.output_text.delta", "response.reasoning_summary_text.delta"}:
+        return
+
+    parts = [
+        f"  event +{entry.get('elapsed_seconds', 0):.3f}s",
+        str(event_type),
+    ]
+    if entry.get("item_type"):
+        parts.append(f"item={entry['item_type']}")
+    if entry.get("item_status"):
+        parts.append(f"status={entry['item_status']}")
+    if entry.get("item_name"):
+        parts.append(f"name={entry['item_name']}")
+    if entry.get("queries"):
+        parts.append(f"queries={len(entry['queries'])}")
+    if entry.get("result_files"):
+        filenames = [f.get("filename") for f in entry["result_files"] if f.get("filename")]
+        parts.append(f"files={filenames[:5]}")
+    print(" ".join(parts), flush=True)
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return "ratelimit" in name or "rate limit" in message or "tokens per min" in message
+
+
+def is_tpm_rate_limit(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "tokens per min" in message or "tpm" in message
+
+
+def retry_after_seconds(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        if value:
+            try:
+                return float(value)
+            except ValueError:
+                pass
+
+    match = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", str(exc), re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def create_response_with_retries(
+    client: Any,
+    kwargs: dict[str, Any],
+    args: argparse.Namespace,
+    event_timeline: list[dict[str, Any]],
+    started_monotonic: float,
+) -> Any:
+    default_wait = args.initial_rate_limit_wait
+    for attempt in range(args.max_rate_limit_retries + 1):
+        if attempt:
+            event_timeline.append(
+                {
+                    "timestamp_utc": utc_now_iso(),
+                    "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                    "event_type": "client.retry.started",
+                    "attempt": attempt + 1,
+                }
+            )
+
+        try:
+            if args.stream:
+                with client.responses.stream(**kwargs) as stream:
+                    try:
+                        for event in stream:
+                            event_summary = summarize_event(event, started_monotonic)
+                            event_timeline.append(event_summary)
+                            if args.print_events:
+                                print_event_summary(event_summary)
+                    except Exception as stream_exc:
+                        # Streaming can fail mid-flight (including 429 TPM limits). OpenAI does not
+                        # support reconnecting to an interrupted SSE stream; the practical recovery
+                        # is to start a new Responses request after waiting.
+                        event_timeline.append(
+                            {
+                                "timestamp_utc": utc_now_iso(),
+                                "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                                "event_type": "client.stream.error",
+                                "attempt": attempt + 1,
+                                "error_type": type(stream_exc).__name__,
+                                "error": str(stream_exc),
+                            }
+                        )
+                        raise stream_exc
+                    return stream.get_final_response()
+            return client.responses.create(**kwargs)
+        except Exception as exc:
+            if not is_rate_limit_error(exc) or attempt >= args.max_rate_limit_retries:
+                event_timeline.append(
+                    {
+                        "timestamp_utc": utc_now_iso(),
+                        "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                        "event_type": "client.request.error",
+                        "attempt": attempt + 1,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                raise
+
+            wait_from_api = retry_after_seconds(exc)
+            wait_seconds = (wait_from_api if wait_from_api is not None else default_wait) + args.rate_limit_wait_buffer
+            max_wait = args.max_rate_limit_wait
+            if is_tpm_rate_limit(exc):
+                max_wait = max(max_wait, args.max_rate_limit_wait_tpm)
+            if is_tpm_rate_limit(exc) and args.tpm_wait_floor > 0:
+                wait_seconds = max(wait_seconds, args.tpm_wait_floor)
+            wait_seconds = min(wait_seconds, max_wait)
+            event_timeline.append(
+                {
+                    "timestamp_utc": utc_now_iso(),
+                    "elapsed_seconds": round(time.monotonic() - started_monotonic, 3),
+                    "event_type": "client.rate_limit.wait",
+                    "attempt": attempt + 1,
+                    "wait_seconds": round(wait_seconds, 3),
+                    "api_retry_after_seconds": wait_from_api,
+                    "max_wait_cap_seconds": max_wait,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            print(
+                f"  rate limited on attempt {attempt + 1}; waiting {wait_seconds:.1f}s before retry",
+                flush=True,
+            )
+            time.sleep(wait_seconds)
+            default_wait = min(default_wait * 2, max_wait)
+
+    raise RuntimeError("unreachable retry loop exit")
 
 
 def build_tools(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -308,14 +522,15 @@ def run_one_question(client: Any, row: pd.Series, args: argparse.Namespace) -> d
     if args.include_encrypted_reasoning:
         # This is encrypted reasoning state, not raw chain-of-thought text.
         include.append("reasoning.encrypted_content")
+    reasoning: dict[str, str] = {"effort": args.reasoning_effort}
+    if args.reasoning_summary != "none":
+        reasoning["summary"] = args.reasoning_summary
+
     kwargs: dict[str, Any] = {
         "model": args.model,
         "input": make_agent_input(str(row["question"])),
         "tools": build_tools(args),
-        "reasoning": {
-            "effort": args.reasoning_effort,
-            "summary": args.reasoning_summary,
-        },
+        "reasoning": reasoning,
         "max_output_tokens": args.max_output_tokens,
     }
     if include:
@@ -333,13 +548,7 @@ def run_one_question(client: Any, row: pd.Series, args: argparse.Namespace) -> d
         }
     ]
 
-    if args.stream:
-        with client.responses.stream(**kwargs) as stream:
-            for event in stream:
-                event_timeline.append(summarize_event(event, started_monotonic))
-            response = stream.get_final_response()
-    else:
-        response = client.responses.create(**kwargs)
+    response = create_response_with_retries(client, kwargs, args, event_timeline, started_monotonic)
 
     finished_wall = utc_now_iso()
     elapsed_seconds = time.monotonic() - started_monotonic
@@ -359,6 +568,8 @@ def run_one_question(client: Any, row: pd.Series, args: argparse.Namespace) -> d
 
     ok, rationale = fuzzy_match_answer(str(row["answer"]), pred, args.tolerance)
     input_tokens, output_tokens, reasoning_tokens = usage_counts(response)
+    file_search_calls = file_search_items(response)
+    annotations = content_annotations(response)
 
     return {
         "uid": row["uid"],
@@ -391,9 +602,16 @@ def run_one_question(client: Any, row: pd.Series, args: argparse.Namespace) -> d
         "response_metadata": response_metadata(response),
         "response_output_items": response_output_items(response),
         "reasoning_items": reasoning_items(response),
-        "content_annotations": content_annotations(response),
+        "content_annotations": annotations,
         "tool_call_items": tool_call_items(response),
-        "file_search_calls": file_search_items(response),
+        "file_search_calls": file_search_calls,
+        "file_search_queries": [
+            query
+            for call in file_search_calls
+            for query in call.get("queries", [])
+        ],
+        "retrieved_files": retrieved_files_from_search(response),
+        "cited_files": cited_files(response),
         "response_id": getattr(response, "id", None),
     }
 
@@ -432,7 +650,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
     scores: list[float] = []
     total_cost = 0.0
     with args.output.open("w", encoding="utf-8") as out:
-        for _, row in df.iterrows():
+        for i, (_, row) in enumerate(df.iterrows()):
             print(f"running {row['uid']}...", flush=True)
             result = run_one_question(client, row, args)
             scores.append(float(result["score"]))
@@ -444,6 +662,8 @@ def cmd_eval(args: argparse.Namespace) -> None:
                 f"tokens={result['input_tokens']}+{result['output_tokens']} "
                 f"cost=${result['estimated_cost_usd']:.4f}"
             )
+            if args.sleep_between_samples > 0 and i < len(df) - 1:
+                time.sleep(args.sleep_between_samples)
 
     mean_score = sum(scores) / len(scores) if scores else 0.0
     print(f"\nwrote {args.output}")
@@ -477,7 +697,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_p.add_argument(
         "--reasoning-summary",
-        choices=["auto", "concise", "detailed"],
+        choices=["none", "auto", "concise", "detailed"],
         default="auto",
         help="Requests exposed reasoning summaries; raw chain-of-thought is not exposed by GPT-5.5",
     )
@@ -489,10 +709,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_p.add_argument("--max-file-results", type=int, default=20)
     eval_p.add_argument("--max-output-tokens", type=int, default=12000)
+    eval_p.add_argument("--max-rate-limit-retries", type=int, default=8)
+    eval_p.add_argument("--initial-rate-limit-wait", type=float, default=10.0)
+    eval_p.add_argument("--max-rate-limit-wait", type=float, default=180.0)
+    eval_p.add_argument(
+        "--max-rate-limit-wait-tpm",
+        type=float,
+        default=420.0,
+        help="max wait cap for tokens-per-minute (TPM) 429s; can exceed --max-rate-limit-wait",
+    )
+    eval_p.add_argument(
+        "--tpm-wait-floor",
+        type=float,
+        default=65.0,
+        help="minimum wait (seconds) after TPM 429s to reduce immediate re-fail in the same minute window",
+    )
+    eval_p.add_argument(
+        "--rate-limit-wait-buffer",
+        type=float,
+        default=2.0,
+        help="extra seconds added to OpenAI retry-after / 'try again in' waits",
+    )
+    eval_p.add_argument(
+        "--sleep-between-samples",
+        type=float,
+        default=0.0,
+        help="optional pause between CSV rows when running many samples (reduces TPM bursts)",
+    )
     eval_p.add_argument("--tolerance", type=float, default=0.01)
     eval_p.add_argument("--no-web-search", action="store_true")
     eval_p.add_argument("--web-search-tool", type=str, default="web_search_preview")
     eval_p.add_argument("--include-search-results", action="store_true")
+    eval_p.add_argument(
+        "--print-events",
+        action="store_true",
+        help="print non-delta streaming events live so you can see tool/action progress before final JSONL",
+    )
     eval_p.add_argument(
         "--include-encrypted-reasoning",
         action="store_true",

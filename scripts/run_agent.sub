@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Single-sample OfficeQA agent eval (scripts/agentic.py).
+#
+# Prerequisites:
+#   export OPENAI_API_KEY='sk-...'   # never commit keys; use your shell or scheduler env
+# Run from anywhere:
+#   bash scripts/run_agent.sub
+#
+# Optional overrides before invoking:
+#   export OFFICEQA_VECTOR_STORE_ID=vs_...
+#   export OFFICEQA_UID=UID0204
+#   export OFFICEQA_REASONING_EFFORT=high
+#   export OFFICEQA_REASONING_SUMMARY=auto
+#   export OFFICEQA_INCLUDE_SEARCH_RESULTS=0   # disable exact retrieved-file logging
+#   export OFFICEQA_ENABLE_WEB_SEARCH=1
+#   export OFFICEQA_OUTPUT=outputs/agentic_UID0204.jsonl
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+: "${OPENAI_API_KEY:?Set OPENAI_API_KEY (do not put it in this file)}"
+VECTOR_STORE_ID="${OFFICEQA_VECTOR_STORE_ID:-vs_69f78142203c8191bbedb980481a6602}"
+# Do not use shell variable name UID — bash sets it readonly (numeric user id).
+QUESTION_UID="${OFFICEQA_UID:-UID0001}"
+OUTPUT="${OFFICEQA_OUTPUT:-outputs/agentic_${QUESTION_UID}.jsonl}"
+REASONING_EFFORT="${OFFICEQA_REASONING_EFFORT:-low}"
+REASONING_SUMMARY="${OFFICEQA_REASONING_SUMMARY:-none}"
+MAX_FILE_RESULTS="${OFFICEQA_MAX_FILE_RESULTS:-3}"
+MAX_OUTPUT_TOKENS="${OFFICEQA_MAX_OUTPUT_TOKENS:-1500}"
+
+mkdir -p "$(dirname "$OUTPUT")"
+
+CMD=(
+python3 scripts/agentic.py eval
+  --vector-store-id "${VECTOR_STORE_ID}" \
+  --uid "${QUESTION_UID}" \
+  --output "${OUTPUT}" \
+  --tool-choice required \
+  --reasoning-effort "${REASONING_EFFORT}" \
+  --reasoning-summary "${REASONING_SUMMARY}" \
+  --max-file-results "${MAX_FILE_RESULTS}" \
+  --max-output-tokens "${MAX_OUTPUT_TOKENS}" \
+  --max-rate-limit-retries 12 \
+  --initial-rate-limit-wait 10 \
+  --max-rate-limit-wait 180 \
+  --max-rate-limit-wait-tpm 420 \
+  --tpm-wait-floor 65 \
+  --rate-limit-wait-buffer 2 \
+  --sleep-between-samples 0 \
+  --no-web-search \
+  --print-events
+)
+
+if [[ "${OFFICEQA_ENABLE_WEB_SEARCH:-0}" == "1" ]]; then
+  for i in "${!CMD[@]}"; do
+    if [[ "${CMD[$i]}" == "--no-web-search" ]]; then
+      unset 'CMD[$i]'
+    fi
+  done
+fi
+
+if [[ "${OFFICEQA_INCLUDE_SEARCH_RESULTS:-1}" == "1" ]]; then
+  CMD+=(--include-search-results)
+fi
+
+"${CMD[@]}"
